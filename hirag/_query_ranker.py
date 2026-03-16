@@ -184,11 +184,10 @@ async def cross_encoder_rank_for_passages(query, documents):
 
 async def cross_encoder_rank_for_text_units(query, documents, min_score_threshold=-9999, agg="mean"):
     doc_scores = []
-
+    #logging.info(f"Cross_encoder chunking")
     for doc in documents:
         chunks = chunk_text(doc)
         pairs = [(query, chunk) for chunk in chunks]
-        
         scores = cross_encoder_model.predict(pairs)
 
         # Aggregate chunk scores into one document score
@@ -236,31 +235,43 @@ def combine_scores(semantic_scores, bm25_scores, graph_scores, meta_scores,
 def combine_scores_adaptive_weights(semantic_scores, bm25_scores, graph_scores, meta_scores):
 
     # Stack signals into array [n_samples, n_signals]
-    logging.info(
-        "semantic_scores: " +
-        ", ".join([f"{w:.4f}" for w in semantic_scores])
-    )
-    logging.info(
-        "bm25_scores : " +
-        ", ".join([f"{w:.4f}" for w in bm25_scores])
-    ) 
+    # logging.info(
+    #     "semantic_scores: " +
+    #     ", ".join([f"{w:.4f}" for w in semantic_scores])
+    # )
+    # logging.info(
+    #     "bm25_scores : " +
+    #     ", ".join([f"{w:.4f}" for w in bm25_scores])
+    # )
+    # logging.info(
+    #     "graph_scores : " +
+    #     ", ".join([f"{w:.4f}" for w in graph_scores])
+    # ) 
+    # logging.info(
+    #     "meta_scores : " +
+    #     ", ".join([f"{w:.4f}" for w in meta_scores])
+    # ) 
     signals = np.array([semantic_scores, bm25_scores, graph_scores, meta_scores])
 
     # Compute variance for each signal
     variances = np.var(signals, axis=1)
-
+    means = np.mean(signals, axis=1)
+    
     # Avoid division by zero: replace 0 variance with small epsilon
-    variances = np.where(variances == 0, 1e-8, variances)
+    variances = np.where(variances < 1e-3, 1e-3, variances)
 
     # Inverse variance weighting
     inv_var = 1.0 / variances
-    weights = inv_var / np.sum(inv_var)
+    blended = inv_var * means    
+
+    weights = blended / np.sum(blended)
+    #weights = inv_var / np.sum(inv_var)
 
 #    logging.info(f"Adaptive Weights: {weights}")
-    logging.info(
-        "Multisignal Adaptive Weights: " +
-        ", ".join([f"{w:.4f}" for w in weights])
-    )
+    # logging.info(
+    #     "Multisignal Adaptive Weights: " +
+    #     ", ".join([f"{w:.4f}" for w in weights])
+    # )
     
     # Weighted combination
     combined = []
@@ -333,7 +344,7 @@ def final_metadata_integration(nodes_data, bm25_scores, graph_scores,
 # -------------------------------
 # Async pipeline runner (MAIN)
 # -------------------------------
-async def rerank_pipeline_entities(query, nodes_data, top_k=20, ce_weight=0.5):
+async def rerank_pipeline_entities_full(query, nodes_data):
     # Step 1: Prepare descriptions and semantic scores
     descriptions = [n['description'] for n in nodes_data]
     semantic_scores = [n['distance'] for n in nodes_data]  # already provided
@@ -354,18 +365,18 @@ async def rerank_pipeline_entities(query, nodes_data, top_k=20, ce_weight=0.5):
     multi_score_nodes = []
     for i, n in enumerate(nodes_data):
         enriched = dict(n)
-        enriched["bm25_score"] = bm25_scores[i]
-        enriched["graph_score"] = graph_scores[i]
-        enriched["meta_score"] = meta_scores[i]
+        # enriched["bm25_score"] = bm25_scores[i]
+        # enriched["graph_score"] = graph_scores[i]
+        # enriched["meta_score"] = meta_scores[i]
         enriched["multi_signal_score"] = combined_scores[i]
         multi_score_nodes.append(enriched)
 
     # Step 4: Sort by multi-signal score and keep top 2*top_k
-    multi_score_nodes = sorted(
-        multi_score_nodes,
-        key=lambda x: x["multi_signal_score"],
-        reverse=True
-    )[:top_k * 2]
+    # multi_score_nodes = sorted(
+    #     multi_score_nodes,
+    #     key=lambda x: x["multi_signal_score"],
+    #     reverse=True
+    # )[:top_k * 2]
 
     # Step 5: Cross-encoder scores
     ce_descriptions = [n['description'] for n in multi_score_nodes]
@@ -379,7 +390,7 @@ async def rerank_pipeline_entities(query, nodes_data, top_k=20, ce_weight=0.5):
         enriched_nodes.append(enriched_for_ce)
 
     # Step 7: Sort by CE score and keep top_k
-    ce_entities = sorted(enriched_nodes, key=lambda x: x["ce_score"], reverse=True)[:top_k]
+    #ce_entities = sorted(enriched_nodes, key=lambda x: x["ce_score"], reverse=True)
     
     # Step 8: Get adaptive weights
     multi_score = np.array([n["multi_signal_score"] for n in ce_entities], dtype=float)
@@ -398,9 +409,8 @@ async def rerank_pipeline_entities(query, nodes_data, top_k=20, ce_weight=0.5):
     inv_var = 1.0 / variances
     weights = inv_var / np.sum(inv_var)
 
-    # logging.info(f"Cross Encoder Adaptive Weights: {weights:.4f}")
     logging.info(
-        "CommunityReport_Cross Encoder Adaptive Weights: " +
+        "Entities_Cross Encoder Adaptive Weights: " +
         ", ".join([f"{w:.4f}" for w in weights])
     )
 
@@ -418,10 +428,99 @@ async def rerank_pipeline_entities(query, nodes_data, top_k=20, ce_weight=0.5):
 
     return reranked_entities
 
+async def rerank_pipeline_entities(query, nodes_data):
+    """
+    Rerank entities using multiple signals (semantic, BM25, graph, meta, cross-encoder)
+    and adaptive weighting.
+
+    Args:
+        query (str): The input query string.
+        nodes_data (list[dict]): List of node dictionaries with 'description' and 'distance'.
+        top_k (int): Number of top entities to keep after reranking.
+
+    Returns:
+        list[dict]: Reranked entities with final scores.
+    """
+
+    # Step 1: Prepare base signals
+    descriptions = [n['description'] for n in nodes_data]
+    semantic_scores = [n['distance'] for n in nodes_data]
+
+    # Step 2: Run async tasks in parallel
+    bm25_task = bm25_score(query, descriptions)
+    graph_task = graph_scoring(nodes_data)
+    meta_task = metaboost_score(query, nodes_data)
+
+    bm25_scores, graph_scores, meta_scores = await asyncio.gather(
+        bm25_task, graph_task, meta_task
+    )
+
+    # Step 3: Combine scores with adaptive weights
+    combined_scores = combine_scores_adaptive_weights(
+        semantic_scores, bm25_scores, graph_scores, meta_scores
+    )
+
+    multi_score_nodes = [
+        {**n, "multi_signal_score": combined_scores[i]}
+        for i, n in enumerate(nodes_data)
+    ]
+
+    # Step 4: Cross-encoder scoring
+    ce_descriptions = [n['description'] for n in multi_score_nodes]
+    ce_scores = await cross_encoder_rank(query, ce_descriptions)
+
+    enriched_nodes = [
+        {**n, "ce_score": ce_scores[i]}
+        for i, n in enumerate(multi_score_nodes)
+    ]
+
+    # Step 5: Sort by CE score and keep top_k
+    ce_entities = sorted(enriched_nodes, key=lambda x: x["ce_score"], reverse=True)
+
+    # Step 6: Adaptive weighting between multi-signal and CE scores
+    multi_score = np.array([n["multi_signal_score"] for n in ce_entities], dtype=float)
+    cross_score = np.array([n["ce_score"] for n in ce_entities], dtype=float)
+
+    # logging.info(
+    #     "multi_score : " +
+    #     ", ".join([f"{w:.4f}" for w in multi_score])
+    # )   
+
+    # logging.info(
+    #     "cross_score : " +
+    #     ", ".join([f"{w:.4f}" for w in cross_score])
+    # ) 
+
+    signals = np.vstack([multi_score, cross_score])
+    variances = np.var(signals, axis=1)
+    means = np.mean(signals, axis=1)
+
+    variances = np.where(variances < 1e-2, 1e-2, variances)  # avoid division by zero
     
-    # return final_metadata_integration(nodes_data, bm25_scores, graph_scores,
-    #                                   meta_scores, semantic_scores, ce_scores,
-    #                                   combined_scores)
+    inv_var = 1.0 / variances
+    blended = inv_var * means
+    
+    #weights = inv_var / np.sum(inv_var)
+    weights = blended / np.sum(blended)
+    
+    logging.info(
+        "Entities_Cross Encoder Adaptive Weights: " +
+        ", ".join([f"{w:.4f}" for w in weights])
+    )
+
+    # Step 7: Compute final hybrid score
+    reranked_entities = [
+        {
+            **h,
+            "final_score": (weights[1] * h["ce_score"]) + (weights[0] * h["multi_signal_score"])
+        }
+        for h in ce_entities
+    ]
+
+    # Step 8: Sort by final score
+    reranked_entities = sorted(reranked_entities, key=lambda x: x["final_score"], reverse=True)
+
+    return reranked_entities
 
 # -------------------------------
 # Async pipeline runner for communities
@@ -597,7 +696,6 @@ async def rerank_pipeline_edges(query, edges, ce_weight=0.5):
 
     # Sort by query_rank
     return sorted(results, key=lambda x: x["query_rank"], reverse=True)
-
 
 # -------------------------------
 # Async pipeline runner for text units
@@ -817,17 +915,17 @@ async def rerank_communities(
     descriptions = []
     
     for c in community_reports:
-        report_json = c.get("report_json", {})
+    #     report_json = c.get("report_json", {})
         
-        # Parse findings from JSON string
-        findings_str = report_json.get("findings", "[]")
-        findings = parse_findings(findings_str)
+    #     # Parse findings from JSON string
+    #     findings_str = report_json.get("findings", "[]")
+    #     findings = parse_findings(findings_str)
         
-        # Build findings text
-        findings_text = " ".join([
-            f"{f.get('summary', '')} {f.get('explanation_text', '')}"
-            for f in findings
-        ])
+    #     # Build findings text
+    #     findings_text = " ".join([
+    #         f"{f.get('summary', '')} {f.get('explanation_text', '')}"
+    #         for f in findings
+    #     ])
         
         # Combine all text fields for semantic matching
         description = (
@@ -838,68 +936,69 @@ async def rerank_communities(
         )
         descriptions.append(description)
     
-    # Compute query embedding
-    query_emb = semantic_model.encode([query], convert_to_numpy=True)[0]
+    # # Compute query embedding
+    # query_emb = semantic_model.encode([query], convert_to_numpy=True)[0]
     
-    # Semantic similarity scores
-    semantic_scores = await embed_documents_async_comm(
-        query_emb, descriptions, agg=agg
-    )
-    semantic_scores = normalize_scores(semantic_scores)
+    # # Semantic similarity scores
+    # semantic_scores = await embed_documents_async_comm(
+    #     query_emb, descriptions, agg=agg
+    # )
+    # semantic_scores = normalize_scores(semantic_scores)
     
-    # BM25 scores
-    bm25_scores = await bm25_score(query, descriptions)
+    # # BM25 scores
+    # bm25_scores = await bm25_score(query, descriptions)
     
-    # Combine semantic and BM25 scores
-    combined_scores = combine_scores_adaptive_weights_2signals(
-        semantic_scores,
-        bm25_scores,
-    )
-    # Assign combined scores to reports
-    for i, c in enumerate(community_reports):
-        c['combined_score'] = combined_scores[i]
+    # # Combine semantic and BM25 scores
+    # combined_scores = combine_scores_adaptive_weights_2signals(
+    #     semantic_scores,
+    #     bm25_scores,
+    # )
+    # # Assign combined scores to reports
+    # for i, c in enumerate(community_reports):
+    #     c['combined_score'] = combined_scores[i]
     
     # Cross-encoder reranking
 
     ce_results = await cross_encoder_rank_for_text_units(query, descriptions)
     raw_ce_scores = [item["score"] for item in ce_results]
     ce_scores = normalize_scores(raw_ce_scores)
-    
+    for i, c in enumerate(community_reports):
+        c['final_score'] = ce_scores[i]    
     # Assign cross-encoder scores
-    for i, c in enumerate(community_reports):
-        c['ce_score'] = ce_scores[i]
+    # for i, c in enumerate(community_reports):
+    #     c['ce_score'] = ce_scores[i]
 
     #change2
-    multi_score = np.array([c["combined_score"] for c in community_reports], dtype=float)
-    cross_score = np.array([c["ce_score"] for c in community_reports], dtype=float)
+    # multi_score = np.array([c["combined_score"] for c in community_reports], dtype=float)
+    # cross_score = np.array([c["ce_score"] for c in community_reports], dtype=float)
 
-    # Stack signals into array [n_samples, n_signals]
-    signals = np.array([multi_score, cross_score])
+    # # Stack signals into array [n_samples, n_signals]
+    # signals = np.array([multi_score, cross_score])
 
-    # Compute variance for each signal
-    variances = np.var(signals, axis=1)
+    # # Compute variance for each signal
+    # variances = np.var(signals, axis=1)
 
-    # Avoid division by zero: replace 0 variance with small epsilon
-    variances = np.where(variances == 0, 1e-8, variances)
+    # # Avoid division by zero: replace 0 variance with small epsilon
+    # variances = np.where(variances == 0, 1e-8, variances)
 
-    # Inverse variance weighting
-    inv_var = 1.0 / variances
-    weights = inv_var / np.sum(inv_var)
+    # # Inverse variance weighting
+    # inv_var = 1.0 / variances
+    # weights = inv_var / np.sum(inv_var)
 
-    # logging.info(f"CommunityReport_Cross Encoder Adaptive Weights: {weights:.4f}")
-    logging.info(
-        "CommunityReport_Cross Encoder Adaptive Weights: " +
-        ", ".join([f"{w:.4f}" for w in weights])
-    )
+    # # logging.info(f"CommunityReport_Cross Encoder Adaptive Weights: {weights:.4f}")
+    # logging.info(
+    #     "CommunityReport_Cross Encoder Adaptive Weights: " +
+    #     ", ".join([f"{w:.4f}" for w in weights])
+    # )
     
-    #change2
+    # #change2
     
-    # Compute final weighted score
-    for i, c in enumerate(community_reports):
-        c['final_score'] = (
-            weights[1] * c['ce_score'] +
-            (1 - weights[1]) * c['combined_score']
-        )
+    # # Compute final weighted score
+    # for i, c in enumerate(community_reports):
+    #     c['final_score'] = (
+    #         weights[1] * c['ce_score'] +
+    #         (1 - weights[1]) * c['combined_score']
+    #     )
     
     # Sort by final score (descending)
     ranked_reports = sorted(
@@ -929,52 +1028,53 @@ async def rerank_text_units(query, text_units, ce_weight=0.5):
     # Use content as description
     descriptions = [tu.get("content", "") for tu in text_units]
 
-    # Semantic scores
-    query_emb = semantic_model.encode([query], convert_to_numpy=True)[0]
-    desc_embs = await embed_documents_async(descriptions)
+#     # Semantic scores
+#     query_emb = semantic_model.encode([query], convert_to_numpy=True)[0]
+#     desc_embs = await embed_documents_async(descriptions)
 
-    semantic_scores = [
-        float(np.dot(query_emb, d) / (np.linalg.norm(query_emb) * np.linalg.norm(d)))
-        for d in desc_embs
-    ]
-    semantic_scores = normalize_scores(semantic_scores)
+#     semantic_scores = [
+#         float(np.dot(query_emb, d) / (np.linalg.norm(query_emb) * np.linalg.norm(d)))
+#         for d in desc_embs
+#     ]
+#     semantic_scores = normalize_scores(semantic_scores)
 
-    # BM25 lexical scores
-    bm25_scores = await bm25_score(query, descriptions)
-#change1
-    combined_scores = combine_scores_adaptive_weights_2signals( 
-        semantic_scores, 
-        bm25_scores, 
-    )
+#     # BM25 lexical scores
+#     bm25_scores = await bm25_score(query, descriptions)
+# #change1
+#     combined_scores = combine_scores_adaptive_weights_2signals( 
+#         semantic_scores, 
+#         bm25_scores, 
+#     )
 
-    for i, tu in enumerate(text_units):
-        tu['combined_score'] = combined_scores[i]
+#     for i, tu in enumerate(text_units):
+#         tu['combined_score'] = combined_scores[i]
 
     # Cross-encoder scores
     ce_results = await cross_encoder_rank_for_text_units(query, descriptions)
 
     raw_ce_scores = [item["score"] for item in ce_results]
     ce_scores = normalize_scores(raw_ce_scores)
-
     for i, tu in enumerate(text_units):
-        tu['ce_score'] = ce_scores[i]
+        tu['final_score'] = ce_scores[i]
+    # for i, tu in enumerate(text_units):
+    #     tu['ce_score'] = ce_scores[i]
 
     #change2
-    multi_score = np.array([tu["combined_score"] for tu in text_units], dtype=float)
-    cross_score = np.array([tu["ce_score"] for tu in text_units], dtype=float)
+    # multi_score = np.array([tu["combined_score"] for tu in text_units], dtype=float)
+    # cross_score = np.array([tu["ce_score"] for tu in text_units], dtype=float)
 
-    # Stack signals into array [n_samples, n_signals]
-    signals = np.array([multi_score, cross_score])
+    # # Stack signals into array [n_samples, n_signals]
+    # signals = np.array([multi_score, cross_score])
 
-    # Compute variance for each signal
-    variances = np.var(signals, axis=1)
+    # # Compute variance for each signal
+    # variances = np.var(signals, axis=1)
 
-    # Avoid division by zero: replace 0 variance with small epsilon
-    variances = np.where(variances == 0, 1e-8, variances)
+    # # Avoid division by zero: replace 0 variance with small epsilon
+    # variances = np.where(variances == 0, 1e-8, variances)
 
-    # Inverse variance weighting
-    inv_var = 1.0 / variances
-    weights = inv_var / np.sum(inv_var)
+    # # Inverse variance weighting
+    # inv_var = 1.0 / variances
+    # weights = inv_var / np.sum(inv_var)
 
     # logging.info(f"TextUnits_Cross Encoder Adaptive Weights: {weights:.4f}")
     # logging.info(
@@ -986,11 +1086,11 @@ async def rerank_text_units(query, text_units, ce_weight=0.5):
 
     #change3
     # Compute final weighted score
-    for i, tu in enumerate(text_units):
-        tu['final_score'] = (
-            weights[1] * tu['ce_score'] +
-            (1-weights[1]) * tu['combined_score']
-        )
+    # for i, tu in enumerate(text_units):
+    #     tu['final_score'] = (
+    #         weights[1] * tu['ce_score'] +
+    #         (1-weights[1]) * tu['combined_score']
+    #     )
     #change3
     # Sort by final score (descending)
     ranked_text_units = sorted(

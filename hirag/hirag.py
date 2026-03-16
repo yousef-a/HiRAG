@@ -7,6 +7,7 @@ from typing import Callable, Dict, List, Optional, Type, Union, cast
 
 import tiktoken
 
+import re
 
 from ._llm import (
     gpt_4o_complete,
@@ -52,7 +53,6 @@ from .base import (
     StorageNameSpace,
     QueryParam,
 )
-
 
 @dataclass
 class HiRAG:
@@ -140,6 +140,11 @@ class HiRAG:
     convert_response_to_json_func: callable = convert_response_to_json
 
     def __post_init__(self):
+        # check for mode
+        index_mode = self.addon_params.get("index_mode", "hi")
+        if index_mode not in ("hi", "hi_causal"):
+            raise ValueError(f"Unknown index_mode: {index_mode}")
+
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self).items()])
         logger.debug(f"HiRAG init with param:\n\n  {_print_config}\n")
 
@@ -223,7 +228,8 @@ class HiRAG:
     async def aquery(self, query: str, param: QueryParam = QueryParam()):
         if param.mode == "naive" and not self.enable_naive_rag:
             raise ValueError("enable_naive_rag is False, cannot query in naive mode")
-        if param.mode == "hi" and not self.enable_hierachical_mode:
+        # if param.mode == "hi" and not self.enable_hierachical_mode:
+        if param.mode in ("hi", "hi_causal") and not self.enable_hierachical_mode:
             raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical mode")
         if param.mode == "hi_nobridge" and not self.enable_hierachical_mode:
             raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_nobridge mode")
@@ -233,11 +239,22 @@ class HiRAG:
             raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_local mode")
         if param.mode == "hi_global" and not self.enable_hierachical_mode:
             raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_global mode")
-        if param.mode == "hi_rerank" and not self.enable_hierachical_mode:
-            raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_rerank mode")
+        if param.mode == "hi_causal" and not self.enable_hierachical_mode:
+            raise ValueError("enable_hierachical_mode is False, cannot query in hi_causal mode")
 
-        if param.mode == "hi":                        # retrieve with hierarchical knowledge
+        #if param.mode == "hi":                        # retrieve with hierarchical knowledge
+        if param.mode in ("hi", "hi_causal"):                        # retrieve with hierarchical knowledge            
             response = await hierarchical_query(
+                query,
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.community_reports,
+                self.text_chunks,
+                param,
+                asdict(self),
+            )
+        elif param.mode == "hi_rerank":
+            response = await hierarchical_query_reranked(
                 query,
                 self.chunk_entity_relation_graph,
                 self.entities_vdb,
@@ -256,16 +273,6 @@ class HiRAG:
                 param,
                 asdict(self),
             )
-        elif param.mode == "hi_rerank":                        # retrieve with hierarchical knowledge with reranker
-            response = await hierarchical_query_reranked(
-                query,
-                self.chunk_entity_relation_graph,
-                self.entities_vdb,
-                self.community_reports,
-                self.text_chunks,
-                param,
-                asdict(self),
-            )          
         elif param.mode == "hi_local":                  # retrieve with only local knowledge
             response = await hierarchical_local_query(
                 query,
@@ -378,13 +385,15 @@ class HiRAG:
             await self.chunk_entity_relation_graph.clustering(
                 self.graph_cluster_algorithm                    # use leiden
             )
+            
+            await self.text_chunks.upsert(inserting_chunks)
             await generate_community_report(
                 self.community_reports, self.chunk_entity_relation_graph, asdict(self)
             )
 
             # ---------- commit upsertings and indexing
             await self.full_docs.upsert(new_docs)
-            await self.text_chunks.upsert(inserting_chunks)
+            # await self.text_chunks.upsert(inserting_chunks)
         finally:
             await self._insert_done()
 

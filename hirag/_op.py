@@ -1,4 +1,3 @@
-import secrets
 import re
 import json
 import asyncio
@@ -31,10 +30,9 @@ from .base import (
     TextChunkSchema,
     QueryParam,
 )
-from ._query_ranker import rerank_pipeline_entities, rerank_pipeline_edges, rerank_text_units, rerank_communities
-# from ._community_report_reranker import 
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
 from ._cluster_utils import Hierarchical_Clustering
+from ._query_ranker import rerank_pipeline_entities, rerank_text_units, rerank_communities
 
 @contextmanager
 def timer():
@@ -203,16 +201,97 @@ async def _handle_single_relationship_extraction(
     target = clean_str(record_attributes[2].upper())
     edge_description = clean_str(record_attributes[3])
     edge_source_id = chunk_key
-    weight = (
-        float(record_attributes[-1]) if is_float_regex(record_attributes[-1]) else 1.0
-    )
+
+    ## added for causality
+    # Default (non-causal)
+    causal = {
+        "is_causal": "false",
+        "causal_direction": "unknown",
+        "causal_strength": 0.0,
+        "causal_type": "unknown",
+        "causal_evidence": "",
+        "causal_notes": "",
+    }
+
+    # OLD FORMAT: ("relationship", src, tgt, desc, strength)
+    if len(record_attributes) == 5:
+        weight = float(record_attributes[4]) if is_float_regex(record_attributes[4]) else 1.0
+        return dict(
+            src_id=source,
+            tgt_id=target,
+            weight=weight,
+            description=edge_description,
+            source_id=edge_source_id,
+            **causal,
+        )
+
+    # NEW FORMAT (expected 11):
+    # ("relationship", src, tgt, desc, is_causal, direction, causal_strength, causal_type, evidence, notes, strength)
+    if len(record_attributes) >= 11:
+        is_causal_raw = clean_str(record_attributes[4]).lower().strip('"').strip("'")
+        direction = clean_str(record_attributes[5]).lower().strip('"').strip("'")
+        causal_strength_raw = clean_str(record_attributes[6])
+        causal_type = clean_str(record_attributes[7]).lower().strip('"').strip("'")
+        evidence = clean_str(record_attributes[8])
+        notes = clean_str(record_attributes[9])
+        strength_raw = clean_str(record_attributes[10])
+
+        is_causal = "true" if is_causal_raw in ("true", "yes", "1") else "false"
+        causal_strength = float(causal_strength_raw) if is_float_regex(causal_strength_raw) else 0.0
+        weight = float(strength_raw) if is_float_regex(strength_raw) else 1.0
+
+       # normalize direction
+        if direction not in ("src_to_tgt", "tgt_to_src", "unknown"):
+            direction = "unknown"
+
+        # if non-causal, force defaults
+        if is_causal == "false":
+            direction = "unknown"
+            causal_strength = 0.0
+            causal_type = "unknown"
+            evidence = ""
+            notes = ""    
+
+        causal.update(
+            {
+                "is_causal": is_causal,
+                "causal_direction": direction if direction in ("src_to_tgt", "tgt_to_src", "unknown") else "unknown",
+                "causal_strength": causal_strength,
+                "causal_type": causal_type or "unknown",
+                "causal_evidence": evidence,
+                "causal_notes": notes,
+            }
+        )
+
+        return dict(
+            src_id=source,
+            tgt_id=target,
+            weight=weight,
+            description=edge_description,
+            source_id=edge_source_id,
+            **causal,
+        )
+
+    # If weird length, fallback safely
+    weight = float(record_attributes[-1]) if is_float_regex(record_attributes[-1]) else 1.0
     return dict(
         src_id=source,
         tgt_id=target,
         weight=weight,
         description=edge_description,
         source_id=edge_source_id,
+        **causal,
     )
+    # weight = (
+    #     float(record_attributes[-1]) if is_float_regex(record_attributes[-1]) else 1.0
+    # )
+    # return dict(
+    #     src_id=source,
+    #     tgt_id=target,
+    #     weight=weight,
+    #     description=edge_description,
+    #     source_id=edge_source_id,
+    # )
 
 
 async def _merge_nodes_then_upsert(
@@ -269,28 +348,50 @@ async def _merge_edges_then_upsert(
     knwoledge_graph_inst: BaseGraphStorage,
     global_config: dict,
 ):
+    already_edge = None
     already_weights = []
     already_source_ids = []
     already_description = []
     already_order = []
+
+    def _edge2dict(edge_obj):
+        if edge_obj is None:
+            return None
+        if isinstance(edge_obj, dict):
+            return edge_obj
+        if isinstance(edge_obj, tuple):
+            # common patterns: (src, tgt, data_dict) OR ((src,tgt), data_dict)
+            if len(edge_obj) >= 3 and isinstance(edge_obj[2], dict):
+                return edge_obj[2]
+            if len(edge_obj) == 2 and isinstance(edge_obj[1], dict):
+                return edge_obj[1]
+        return None
+
     if await knwoledge_graph_inst.has_edge(src_id, tgt_id):
-        already_edge = await knwoledge_graph_inst.get_edge(src_id, tgt_id)
-        already_weights.append(already_edge["weight"])
+        _tmp = await knwoledge_graph_inst.get_edge(src_id, tgt_id)
+        already_edge = _edge2dict(_tmp)
+
+    # Only merge if we actually got a dict
+    if isinstance(already_edge, dict):
+        already_weights.append(float(already_edge.get("weight", 0.0)))
         already_source_ids.extend(
-            split_string_by_multi_markers(already_edge["source_id"], [GRAPH_FIELD_SEP])
+            split_string_by_multi_markers(already_edge.get("source_id", ""), [GRAPH_FIELD_SEP])
         )
-        already_description.append(already_edge["description"])
+        already_description.append(already_edge.get("description", ""))
         already_order.append(already_edge.get("order", 1))
+    else:
+        already_edge = None  # normalize; DO NOTHING ELSE here
 
     # [numberchiffre]: `Relationship.order` is only returned from DSPy's predictions
     order = min([dp.get("order", 1) for dp in edges_data] + already_order)
-    weight = sum([dp["weight"] for dp in edges_data] + already_weights)
+    weight = sum([dp.get("weight", 1.0) for dp in edges_data] + already_weights)
     description = GRAPH_FIELD_SEP.join(
-        sorted(set([dp["description"] for dp in edges_data] + already_description))
+        sorted(set([dp.get("description", "") for dp in edges_data] + already_description))
     )
     source_id = GRAPH_FIELD_SEP.join(
-        set([dp["source_id"] for dp in edges_data] + already_source_ids)
+        set([dp.get("source_id", "") for dp in edges_data] + already_source_ids)
     )
+
     for need_insert_id in [src_id, tgt_id]:
         if not (await knwoledge_graph_inst.has_node(need_insert_id)):
             await knwoledge_graph_inst.upsert_node(
@@ -301,14 +402,152 @@ async def _merge_edges_then_upsert(
                     "entity_type": '"UNKNOWN"',
                 },
             )
+
     description = await _handle_entity_relation_summary(
         (src_id, tgt_id), description, global_config
     )
+
+
+# async def _merge_edges_then_upsert(
+#     src_id: str,
+#     tgt_id: str,
+#     edges_data: list[dict],
+#     knwoledge_graph_inst: BaseGraphStorage,
+#     global_config: dict,
+# ):
+#     already_edge = None
+#     already_weights = []
+#     already_source_ids = []
+#     already_description = []
+#     already_order = []
+
+#     def _edge2dict(edge_obj):
+#         if edge_obj is None:
+#             return None
+#         if isinstance(edge_obj, dict):
+#             return edge_obj
+#         if isinstance(edge_obj, tuple):
+#             # common patterns: (src, tgt, data_dict) OR ((src,tgt), data_dict)
+#             if len(edge_obj) >= 3 and isinstance(edge_obj[2], dict):
+#                 return edge_obj[2]
+#             if len(edge_obj) == 2 and isinstance(edge_obj[1], dict):
+#                 return edge_obj[1]
+#         return None
+
+#     if await knwoledge_graph_inst.has_edge(src_id, tgt_id):
+#         _tmp = await knwoledge_graph_inst.get_edge(src_id, tgt_id)
+#         already_edge = _edge2dict(_tmp)
+
+#     # Only merge if we actually got a dict
+#     if already_edge:
+#         already_weights.append(already_edge.get("weight", 0.0))
+#         already_source_ids.extend(
+#             split_string_by_multi_markers(already_edge.get("source_id", ""), [GRAPH_FIELD_SEP])
+#         )
+#         already_description.append(already_edge.get("description", ""))
+#         already_order.append(already_edge.get("order", 1))
+#     else:
+#         already_edge = None  # normalize
+
+#         already_weights.append(already_edge["weight"])
+#         already_source_ids.extend(
+#             split_string_by_multi_markers(already_edge["source_id"], [GRAPH_FIELD_SEP])
+#         )
+#         already_description.append(already_edge["description"])
+#         already_order.append(already_edge.get("order", 1))
+
+#     # [numberchiffre]: `Relationship.order` is only returned from DSPy's predictions
+#     order = min([dp.get("order", 1) for dp in edges_data] + already_order)
+#     weight = sum([dp["weight"] for dp in edges_data] + already_weights)
+#     description = GRAPH_FIELD_SEP.join(
+#         sorted(set([dp["description"] for dp in edges_data] + already_description))
+#     )
+#     source_id = GRAPH_FIELD_SEP.join(
+#         set([dp["source_id"] for dp in edges_data] + already_source_ids)
+#     )
+#     for need_insert_id in [src_id, tgt_id]:
+#         if not (await knwoledge_graph_inst.has_node(need_insert_id)):
+#             await knwoledge_graph_inst.upsert_node(
+#                 need_insert_id,
+#                 node_data={
+#                     "source_id": source_id,
+#                     "description": description,
+#                     "entity_type": '"UNKNOWN"',
+#                 },
+#             )
+#     description = await _handle_entity_relation_summary(
+#         (src_id, tgt_id), description, global_config
+#     )
+
+     # ----------------------------
+    # NEW: Merge causal fields
+    # ----------------------------
+    def _norm_bool(v) -> bool:
+        if v is None:
+            return False
+        s = str(v).strip().lower().strip('"').strip("'")
+        return s in ("true", "yes", "1")
+
+    def _safe_float(v, default=0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _pick_join_unique(key: str) -> str:
+        vals = []
+        for dp in edges_data:
+            vv = dp.get(key, "")
+            if vv:
+                vals.append(str(vv).strip())
+        if already_edge:
+            vv = already_edge.get(key, "")
+            if vv:
+                vals.append(str(vv).strip())
+        vals = [v for v in vals if v]
+        if not vals:
+            return ""
+        # join unique values using GRAPH_FIELD_SEP (same style as description/source_id)
+        return GRAPH_FIELD_SEP.join(sorted(set(vals)))
+
+    # is_causal: true if ANY says true
+    is_causal_any = any(_norm_bool(dp.get("is_causal")) for dp in edges_data)
+    if already_edge:
+        is_causal_any = is_causal_any or _norm_bool(already_edge.get("is_causal"))
+
+    is_causal = "true" if is_causal_any else "false"
+
+    # causal_strength: max over candidates (only meaningful if causal, but safe either way)
+    strengths = [_safe_float(dp.get("causal_strength", 0.0), 0.0) for dp in edges_data]
+    if already_edge:
+        strengths.append(_safe_float(already_edge.get("causal_strength", 0.0), 0.0))
+    causal_strength = max(strengths) if strengths else 0.0
+
+    causal_direction = _pick_join_unique("causal_direction") or "unknown"
+    causal_type = _pick_join_unique("causal_type") or "unknown"
+    causal_evidence = _pick_join_unique("causal_evidence")
+    causal_notes = _pick_join_unique("causal_notes")
+
+    # If non-causal, enforce defaults (keeps data clean)
+    if is_causal == "false":
+        causal_direction = "unknown"
+        causal_strength = 0.0
+        causal_type = "unknown"
+        causal_evidence = ""
+        causal_notes = ""
+
     await knwoledge_graph_inst.upsert_edge(
         src_id,
         tgt_id,
         edge_data=dict(
-            weight=weight, description=description, source_id=source_id, order=order
+            weight=weight, description=description, source_id=source_id, order=order,
+            ## added new params for causality
+            is_causal= is_causal,
+            causal_direction=causal_direction,
+            causal_strength=causal_strength,
+            causal_type=causal_type,
+            causal_evidence=causal_evidence,
+            causal_notes=causal_notes,
         ),
     )
 
@@ -334,7 +573,14 @@ async def extract_hierarchical_entities(
 
     ordered_chunks = list(chunks.items())
     entity_extract_prompt = PROMPTS["hi_entity_extraction"]        # give 3 examples in the prompt context
-    relation_extract_prompt = PROMPTS["hi_relation_extraction"]
+    #relation_extract_prompt = PROMPTS["hi_relation_extraction"]
+    ## added config for hi_causal mode
+    index_mode = global_config.get("addon_params", {}).get("index_mode", "hi")
+    if index_mode == "hi_causal":
+        relation_extract_prompt = PROMPTS["hi_relation_extraction_causal"]
+    else:
+        relation_extract_prompt = PROMPTS["hi_relation_extraction"]
+
 
     context_base_entity = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
@@ -356,7 +602,7 @@ async def extract_hierarchical_entities(
         content = chunk_dp["content"]
         hint_prompt = entity_extract_prompt.format(**context_base_entity, input_text=content)      # fill in the parameter
         final_result = await use_llm_func(hint_prompt)                                      # feed into LLM with the prompt
-
+        
         # check if need gleaning
         history = pack_user_ass_to_openai_messages(hint_prompt, final_result)               # set as history
         if_loop_result: str = await use_llm_func(
@@ -470,6 +716,7 @@ async def extract_hierarchical_entities(
             )
         hint_prompt = relation_extract_prompt.format(**context_base_relation, input_text=content)      # fill in the parameter
         final_result = await use_llm_func(hint_prompt)                                      # feed into LLM with the prompt
+        # print("\n=== RELATION RAW OUTPUT START ===\n", final_result[:2000], "\n=== END ===\n")
 
         # check if need gleaning
         history = pack_user_ass_to_openai_messages(hint_prompt, final_result)               # set as history
@@ -583,6 +830,8 @@ async def extract_hierarchical_entities(
         ]
     )
     # store the edges
+    print("TOTAL maybe_edges:", len(maybe_edges))
+
     await asyncio.gather(                               
         *[
             _merge_edges_then_upsert(k[0], k[1], v, knowledge_graph_inst, global_config)
@@ -997,6 +1246,8 @@ async def _find_most_related_community_from_entities(
     query_param: QueryParam,
     community_reports: BaseKVStorage[CommunitySchema],
 ):
+    #print("Mode inside edge ranking:", query_param.mode) ## debug mode checker
+
     related_communities = []
     for node_d in node_datas:
         if "clusters" not in node_d:
@@ -1123,7 +1374,10 @@ async def _find_most_related_edges_from_entities(
         if v is not None
     ]
     all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+        all_edges_data, 
+        key=lambda x: (x["rank"],
+                        x["weight"],
+                        float(x.get("causal_strength", 0))), reverse=True ## added causal strength as a factor for ranking edges
     )
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
@@ -1145,7 +1399,14 @@ async def _find_most_related_edges_from_paths(
     # all_reasoning_path = await asyncio.gather(
     #                         *[knowledge_graph_inst.get_edge(e[0], e[1]) for e in knowledge_graph_inst._graph.subgraph(path).edges()]
     #                     )
+    # for single_path in path:
+    #     logging.info(f"Path sent in : {single_path}")
+    #logging.info(f"length of incoming path: {len(path)}")
     all_reasoning_path = await knowledge_graph_inst.subgraph_edges(path)
+    #logging.info(f"length of reasoning path: {len(all_reasoning_path)}")    
+    # for single_path in all_reasoning_path:
+    #     logging.info(f"Path sent in : {single_path}")    
+    # logging.info(f"All reasoning path for the given path: {all_reasoning_path}")
     all_edges = set()
     #print(all_reasoning_path)
     all_edges.update([tuple(sorted(e[:2])) for e in all_reasoning_path])
@@ -1161,8 +1422,15 @@ async def _find_most_related_edges_from_paths(
         for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
         if v is not None
     ]
-    all_edges_data = sorted(
-        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+    ### added causal strength as a factor for ranking edges
+    if query_param.mode in ("hi_rerank", "hi_causal"):
+        for e in all_edges_data:
+            causal_strength = float(e.get("causal_strength", 0))
+            e["rank"] = e["rank"] * (1 + causal_strength)
+
+    all_edges_data = sorted(all_edges_data, 
+                            key=lambda x: (x["rank"], x["weight"]), reverse=True 
+
     )
     all_edges_data = truncate_list_by_token_size(
         all_edges_data,
@@ -1223,8 +1491,10 @@ async def _build_local_query_context(
     entities_context = list_of_list_to_csv(entites_section_list)
 
     relations_section_list = [
-        ["id", "source", "target", "description", "weight", "rank"]
+        ["id", "source", "target", "description", "weight", "rank",
+        "is_causal", "causal_direction", "causal_strength", "causal_type"]
     ]
+
     for i, e in enumerate(use_relations):
         relations_section_list.append(
             [
@@ -1234,8 +1504,28 @@ async def _build_local_query_context(
                 e["description"],
                 e["weight"],
                 e["rank"],
+                e.get("is_causal", "false"),
+                e.get("causal_direction", "unknown"),
+                e.get("causal_strength", 0.0),
+                e.get("causal_type", "unknown"),
             ]
         )
+
+    # relations_section_list = [
+    #     ["id", "source", "target", "description", "weight", "rank"]
+    # ]
+    # for i, e in enumerate(use_relations):
+    #     relations_section_list.append(
+    #         [
+    #             i,
+    #             e["src_tgt"][0],
+    #             e["src_tgt"][1],
+    #             e["description"],
+    #             e["weight"],
+    #             e["rank"],
+    #         ]
+    #     )
+
     relations_context = list_of_list_to_csv(relations_section_list)
 
     communities_section_list = [["id", "content"]]
@@ -1265,8 +1555,6 @@ async def _build_local_query_context(
 {text_units_context}
 ```
 """
-
-
 async def _build_hierarchical_query_context(
     query,
     knowledge_graph_inst: BaseGraphStorage,
@@ -1485,7 +1773,244 @@ async def _build_hierarchical_query_context(
 {text_units_context}
 ```
 """
+##########################################
+async def _build_hierarchical_query_context_reranked(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    community_reports: BaseKVStorage[CommunitySchema],
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+):
+    results = await entities_vdb.query(query, top_k=query_param.top_k * 10)          # find the top-k(20) related entities
 
+    if not len(results):    # results just with entity name
+        return None
+    node_datas = await asyncio.gather(      # get full information of retrieved entities
+        *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
+    )
+    if not all([n is not None for n in node_datas]):    # for robustness
+        logger.warning("Some nodes are missing, maybe the storage is damaged")
+    node_degrees = await asyncio.gather(
+        *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in results]
+    )
+    node_datas = [                          # add rank, which is the degree
+        {**n, "entity_name": k["entity_name"], "rank": d, "distance": k["distance"]}
+        for k, n, d in zip(results, node_datas, node_degrees)
+        if n is not None
+    ]
+    overall_node_datas = node_datas
+    node_datas = node_datas[:query_param.top_k]
+    
+    use_communities = await _find_most_related_community_from_entities(     # related communities
+        node_datas, query_param, community_reports
+    )
+    use_text_units = await _find_most_related_text_unit_from_entities(
+        node_datas, query_param, text_chunks_db, knowledge_graph_inst
+    )
+    # use_relations = await _find_most_related_edges_from_entities(
+    #     node_datas, query_param, knowledge_graph_inst
+    # )
+
+    async def find_path_with_required_nodes(knowledge_graph_inst, source, target, required_nodes):
+        # inital final path
+        final_path = []
+        # start node
+        current_node = source
+
+        # all gdb cls
+        from ._storage.gdb_neo4j import Neo4jStorage
+        from ._storage.gdb_networkx import NetworkXStorage
+        
+        # traverse the required nodes
+        for next_node in required_nodes:
+            # 找到从当前节点到下一个必经节点的最短路径
+            try:
+                if isinstance(knowledge_graph_inst, Neo4jStorage):
+                    # use Neo4j's shortest_path method
+                    sub_path = await knowledge_graph_inst.shortest_path(current_node, next_node)
+                elif isinstance(knowledge_graph_inst, NetworkXStorage):
+                    # use NetworkX's shortest_path method
+                    sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=next_node)
+                else:
+                    # use NetworkX by default
+                    sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=next_node)
+            except nx.NetworkXNoPath:
+                # raise ValueError(f"No path between {current_node} and {next_node}.")
+                final_path.extend([next_node])
+                current_node = next_node
+                continue
+            
+            # merge paths (avoid adding the current node again)
+            if final_path:
+                final_path.extend(sub_path[1:])  # add from the second node, avoid adding the current node again
+            else:
+                final_path.extend(sub_path)
+            
+            # update the current node to the next required node
+            current_node = next_node
+
+        # finally, the path from the last required node to the target node
+        try:
+            if isinstance(knowledge_graph_inst, Neo4jStorage):
+                # use Neo4j's shortest_path method
+                sub_path = await knowledge_graph_inst.shortest_path(current_node, target)
+            elif isinstance(knowledge_graph_inst, NetworkXStorage):
+                # use NetworkX's shortest_path method
+                sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=target)
+            else:
+                # use NetworkX by default
+                sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=target)
+            final_path.extend(sub_path[1:])  # add from the second node, avoid adding the current node again
+        except nx.NetworkXNoPath:
+            # raise ValueError(f"No path between {current_node} and {target}.")
+            final_path.extend([target])
+
+        return final_path
+
+    # find some top-k entities in each communities in use_communities
+    key_entities = []
+    max_entity_num = query_param.top_m
+    if use_communities:
+        for c in use_communities:
+            cur_community_key_entities = []
+            community_entities = c['nodes']
+            # find the top-k entities in this community
+            cur_community_key_entities.extend(
+                [e for e in overall_node_datas if e['entity_name'] in community_entities][:max_entity_num]
+            )  
+            key_entities.append(cur_community_key_entities)
+    else:
+        key_entities = [overall_node_datas[:max_entity_num]]
+    # unique key entities
+    key_entities = [[e['entity_name'] for e in k] for k in key_entities]
+    key_entities = list(set([k for kk in key_entities for k in kk]))
+    # find the shortest path between the key entities
+    try:
+        path = await find_path_with_required_nodes(knowledge_graph_inst, key_entities[0], key_entities[-1], key_entities[1:-1])
+        # logging.info(f"entities out of shortest path is : {len(path)}")
+        # path = list(set(path))
+        path_datas = await asyncio.gather(      # get full information of retrieved entities
+            *[knowledge_graph_inst.get_node(r) for r in path]
+        )
+        path_degrees = await asyncio.gather(
+            *[knowledge_graph_inst.node_degree(r) for r in path]
+        )
+        path_datas = [                          # add rank, which is the degree
+            {**n, "entity_name": k, "rank": d}
+            for k, n, d in zip(path, path_datas, path_degrees)
+            if n is not None
+        ]
+        # use_reasoning_path = await _find_most_related_edges_from_entities(
+        #                     path_datas, query_param, knowledge_graph_inst
+        #                 )
+        use_reasoning_path = await _find_most_related_edges_from_paths(
+                                path_datas, path, query_param, knowledge_graph_inst
+                            )
+    except ValueError as e:
+        print(e)
+    
+    # # fetch the relations of the reasoning paths
+    # reasoning_path = []
+    # for i in range(len(path) - 1):
+    #     src = path[i]
+    #     tgt = path[i + 1]
+    #     cur_relation = (await knowledge_graph_inst.get_edge(src, tgt))['description']
+    #     reasoning_path.append(cur_relation)
+    # reasoning_path = list(set(reasoning_path))
+
+    logger.info(
+        f"Using {len(node_datas)} entites, {len(use_communities)} communities, {len(use_reasoning_path)} reasoning path items, {len(use_text_units)} text units"
+    )
+    entites_section_list = [["id", "entity", "type", "description", "rank", "query relevance rank"]]
+
+    if node_datas:
+        node_datas = await rerank_pipeline_entities(query,node_datas)
+
+    for i, n in enumerate(node_datas):
+        entites_section_list.append(
+        [
+            i,
+            n["entity_name"],
+            n.get("entity_type", "UNKNOWN"),
+            n.get("description", "UNKNOWN"),
+            n["rank"],
+            (n["final_score"] * 100) if "final_score" in n and isinstance(n["final_score"], (int, float)) else "Not applicable",
+        ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+    
+    reasoning_path_section_list = [
+        ["id", "source", "target", "description", "weight", "rank",
+        "is_causal", "causal_direction", "causal_strength", "causal_type"]
+    ]
+
+    for i, e in enumerate(use_reasoning_path):
+        reasoning_path_section_list.append(
+            [
+                i,
+                e["src_tgt"][0],
+                e["src_tgt"][1],
+                e["description"],
+                e["weight"],
+                e["rank"],
+                e.get("is_causal", "false"),
+                e.get("causal_direction", "unknown"),
+                e.get("causal_strength", 0.0),
+                e.get("causal_type", "unknown"),
+            ]
+        )
+
+    reasoning_path_context = list_of_list_to_csv(reasoning_path_section_list)
+    
+    # reasoning_path_context = list_of_list_to_csv([["id", "content"]] + [[i, p] for i, p in enumerate(reasoning_path)])
+
+    if use_communities:
+        use_communities = await rerank_communities(query,use_communities)
+    communities_section_list = [["id", "content", "query relevance rank"]]
+    for i, c in enumerate(use_communities):
+        communities_section_list.append([i, c["report_string"].replace("\n", " "), c["final_score"] * 100])
+    communities_context = list_of_list_to_csv(communities_section_list)
+   
+    if use_text_units:
+        use_text_units = await rerank_text_units(query, use_text_units)
+    text_units_section_list = [["id", "content", "query relevance rank"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"], t["final_score"] * 100])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+
+    # display reference info
+    entities = [n["entity_name"] for n in node_datas]
+    communities = [(c["level"], c["title"]) for c in use_communities]
+    chunks = [(t["full_doc_id"], t["chunk_order_index"]) for t in use_text_units]
+
+    references_context = (
+        f"Entities ({len(entities)}): {entities}\n\n"
+        f"Communities (level, cluster_id) ({len(communities)}): {communities}\n\n"
+        f"Chunks (doc_id, chunk_index) ({len(chunks)}): {chunks}\n"
+    )
+
+    #logging.info(f"====== References ======:\n{references_context}")
+    return f"""
+-----Backgrounds-----
+```csv
+{communities_context}
+```
+-----Reasoning Path-----
+```csv
+{reasoning_path_context}
+```
+-----Detail Entity Information-----
+```csv
+{entities_context}
+```
+-----Source Documents-----
+```csv
+{text_units_context}
+```
+"""
+
+###################
 
 async def _build_hibridge_query_context(
     query,
@@ -1496,7 +2021,7 @@ async def _build_hibridge_query_context(
     query_param: QueryParam,
 ):
     results = await entities_vdb.query(query, top_k=query_param.top_k * 10)          # find the top-k(20) related entities
-
+    
     if not len(results):    # results just with entity name
         return None
     node_datas = await asyncio.gather(      # get full information of retrieved entities
@@ -1623,8 +2148,10 @@ async def _build_hibridge_query_context(
     entities_context = list_of_list_to_csv(entites_section_list)
     
     reasoning_path_section_list = [
-        ["id", "source", "target", "description", "weight", "rank"]
+        ["id", "source", "target", "description", "weight", "rank",
+        "is_causal", "causal_direction", "causal_strength", "causal_type"]
     ]
+
     for i, e in enumerate(use_reasoning_path):
         reasoning_path_section_list.append(
             [
@@ -1634,8 +2161,27 @@ async def _build_hibridge_query_context(
                 e["description"],
                 e["weight"],
                 e["rank"],
+                e.get("is_causal", "false"),
+                e.get("causal_direction", "unknown"),
+                e.get("causal_strength", 0.0),
+                e.get("causal_type", "unknown"),
             ]
         )
+
+    # reasoning_path_section_list = [
+    #     ["id", "source", "target", "description", "weight", "rank"]
+    # ]
+    # for i, e in enumerate(use_reasoning_path):
+    #     reasoning_path_section_list.append(
+    #         [
+    #             i,
+    #             e["src_tgt"][0],
+    #             e["src_tgt"][1],
+    #             e["description"],
+    #             e["weight"],
+    #             e["rank"],
+    #         ]
+    #     )
     reasoning_path_context = list_of_list_to_csv(reasoning_path_section_list)
     
     # reasoning_path_context = list_of_list_to_csv([["id", "content"]] + [[i, p] for i, p in enumerate(reasoning_path)])
@@ -1770,11 +2316,13 @@ async def _build_hilocal_query_context(
         )
     entities_context = list_of_list_to_csv(entites_section_list)
     
-    relation_section_list = [
-        ["id", "source", "target", "description", "weight", "rank"]
+    relations_section_list = [
+        ["id", "source", "target", "description", "weight", "rank",
+        "is_causal", "causal_direction", "causal_strength", "causal_type"]
     ]
+
     for i, e in enumerate(use_relations):
-        relation_section_list.append(
+        relations_section_list.append(
             [
                 i,
                 e["src_tgt"][0],
@@ -1782,8 +2330,27 @@ async def _build_hilocal_query_context(
                 e["description"],
                 e["weight"],
                 e["rank"],
+                e.get("is_causal", "false"),
+                e.get("causal_direction", "unknown"),
+                e.get("causal_strength", 0.0),
+                e.get("causal_type", "unknown"),
             ]
         )
+
+    # relation_section_list = [
+    #     ["id", "source", "target", "description", "weight", "rank"]
+    # ]
+    # for i, e in enumerate(use_relations):
+    #     relation_section_list.append(
+    #         [
+    #             i,
+    #             e["src_tgt"][0],
+    #             e["src_tgt"][1],
+    #             e["description"],
+    #             e["weight"],
+    #             e["rank"],
+    #         ]
+    #     )
     relation_context = list_of_list_to_csv(relation_section_list)
     
     text_units_section_list = [["id", "content"]]
@@ -1826,12 +2393,15 @@ async def hierarchical_query(
             text_chunks_db,
             query_param,
         )
-    logging.info(f"Length of context: {len(context)}")
     if query_param.only_need_context:
         return context
     if context is None:
         return PROMPTS["fail_response"]
-    sys_prompt_temp = PROMPTS["local_rag_response"]
+    if query_param.mode in ("hi_rerank", "hi_causal"):
+        sys_prompt_temp = PROMPTS["local_rag_response_causal"]
+    else:
+        sys_prompt_temp = PROMPTS["local_rag_response"]
+
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
@@ -1840,7 +2410,6 @@ async def hierarchical_query(
         system_prompt=sys_prompt,
     )
     return response
-
 async def hierarchical_query_reranked(
     query,
     knowledge_graph_inst: BaseGraphStorage,
@@ -1852,7 +2421,7 @@ async def hierarchical_query_reranked(
 ) -> str:
     use_model_func = global_config["best_model_func"]
     with timer():
-        context = await _build_hierarchical_query_reranked_context(
+        context = await _build_hierarchical_query_context_reranked(
             query,
             knowledge_graph_inst,
             entities_vdb,
@@ -1860,12 +2429,13 @@ async def hierarchical_query_reranked(
             text_chunks_db,
             query_param,
         )
-    logging.info(f"Length of context: {len(context)}")        
     if query_param.only_need_context:
         return context
     if context is None:
         return PROMPTS["fail_response"]
-    sys_prompt_temp = PROMPTS["local_rag_response"]
+        
+    sys_prompt_temp = PROMPTS["local_rag_response_causal"]
+
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
@@ -1873,8 +2443,7 @@ async def hierarchical_query_reranked(
         query,
         system_prompt=sys_prompt,
     )
-    return response
-    
+    return response    
 async def hierarchical_bridge_query(
     query,
     knowledge_graph_inst: BaseGraphStorage,
@@ -2043,237 +2612,3 @@ async def naive_query(
         system_prompt=sys_prompt,
     )
     return response
-
-async def _build_hierarchical_query_reranked_context(
-    query,
-    knowledge_graph_inst: BaseGraphStorage,
-    entities_vdb: BaseVectorStorage,
-    community_reports: BaseKVStorage[CommunitySchema],
-    text_chunks_db: BaseKVStorage[TextChunkSchema],
-    query_param: QueryParam,
-):
-    results = await entities_vdb.query(query, top_k=query_param.top_k * 10)          # find the top-k(20) related entities
-
-    if not len(results):    # results just with entity name
-        return None
-    node_datas = await asyncio.gather(      # get full information of retrieved entities
-        *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
-    )
-    if not all([n is not None for n in node_datas]):    # for robustness
-        logger.warning("Some nodes are missing, maybe the storage is damaged")
-    node_degrees = await asyncio.gather(
-        *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in results]
-    )
-    node_datas = [                          # add rank, which is the degree
-        {**n, "entity_name": k["entity_name"], "rank": d}
-        for k, n, d in zip(results, node_datas, node_degrees)
-        if n is not None
-    ]
-    overall_node_datas = node_datas
-    node_datas = node_datas[:query_param.top_k]
-
-    use_communities = await _find_most_related_community_from_entities(     # related communities
-        node_datas, query_param, community_reports
-    )
-    use_text_units = await _find_most_related_text_unit_from_entities(
-        node_datas, query_param, text_chunks_db, knowledge_graph_inst
-    )
-    # use_relations = await _find_most_related_edges_from_entities(
-    #     node_datas, query_param, knowledge_graph_inst
-    # )
-
-    async def find_path_with_required_nodes(knowledge_graph_inst, source, target, required_nodes):
-        # inital final path
-        final_path = []
-        # start node
-        current_node = source
-
-        # all gdb cls
-        from ._storage.gdb_neo4j import Neo4jStorage
-        from ._storage.gdb_networkx import NetworkXStorage
-        
-        # traverse the required nodes
-        for next_node in required_nodes:
-            # 找到从当前节点到下一个必经节点的最短路径
-            try:
-                if isinstance(knowledge_graph_inst, Neo4jStorage):
-                    # use Neo4j's shortest_path method
-                    sub_path = await knowledge_graph_inst.shortest_path(current_node, next_node)
-                elif isinstance(knowledge_graph_inst, NetworkXStorage):
-                    # use NetworkX's shortest_path method
-                    sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=next_node)
-                else:
-                    # use NetworkX by default
-                    sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=next_node)
-            except nx.NetworkXNoPath:
-                # raise ValueError(f"No path between {current_node} and {next_node}.")
-                final_path.extend([next_node])
-                current_node = next_node
-                continue
-            
-            # merge paths (avoid adding the current node again)
-            if final_path:
-                final_path.extend(sub_path[1:])  # add from the second node, avoid adding the current node again
-            else:
-                final_path.extend(sub_path)
-            
-            # update the current node to the next required node
-            current_node = next_node
-
-        # finally, the path from the last required node to the target node
-        try:
-            if isinstance(knowledge_graph_inst, Neo4jStorage):
-                # use Neo4j's shortest_path method
-                sub_path = await knowledge_graph_inst.shortest_path(current_node, target)
-            elif isinstance(knowledge_graph_inst, NetworkXStorage):
-                # use NetworkX's shortest_path method
-                sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=target)
-            else:
-                # use NetworkX by default
-                sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=target)
-            final_path.extend(sub_path[1:])  # add from the second node, avoid adding the current node again
-        except nx.NetworkXNoPath:
-            # raise ValueError(f"No path between {current_node} and {target}.")
-            final_path.extend([target])
-
-        return final_path
-
-    # find some top-k entities in each communities in use_communities
-    key_entities = []
-    max_entity_num = query_param.top_m
-    if use_communities:
-        for c in use_communities:
-            cur_community_key_entities = []
-            community_entities = c['nodes']
-            # find the top-k entities in this community
-            cur_community_key_entities.extend(
-                [e for e in overall_node_datas if e['entity_name'] in community_entities][:max_entity_num]
-            )
-            key_entities.append(cur_community_key_entities)
-    else:
-        key_entities = [overall_node_datas[:max_entity_num]]
-    # unique key entities
-    key_entities = [[e['entity_name'] for e in k] for k in key_entities]
-    key_entities = list(set([k for kk in key_entities for k in kk]))
-    # find the shortest path between the key entities
-    try:
-        path = await find_path_with_required_nodes(knowledge_graph_inst, key_entities[0], key_entities[-1], key_entities[1:-1])
-        # path = list(set(path))
-        path_datas = await asyncio.gather(      # get full information of retrieved entities
-            *[knowledge_graph_inst.get_node(r) for r in path]
-        )
-        path_degrees = await asyncio.gather(
-            *[knowledge_graph_inst.node_degree(r) for r in path]
-        )
-        path_datas = [                          # add rank, which is the degree
-            {**n, "entity_name": k, "rank": d}
-            for k, n, d in zip(path, path_datas, path_degrees)
-            if n is not None
-        ]
-        # use_reasoning_path = await _find_most_related_edges_from_entities(
-        #                     path_datas, query_param, knowledge_graph_inst
-        #                 )
-        use_reasoning_path = await _find_most_related_edges_from_paths(
-                                path_datas, path, query_param, knowledge_graph_inst
-                            )
-    except ValueError as e:
-        print(e)
-    
-    # # fetch the relations of the reasoning paths
-    # reasoning_path = []
-    # for i in range(len(path) - 1):
-    #     src = path[i]
-    #     tgt = path[i + 1]
-    #     cur_relation = (await knowledge_graph_inst.get_edge(src, tgt))['description']
-    #     reasoning_path.append(cur_relation)
-    # reasoning_path = list(set(reasoning_path))
-
-    logger.info(
-        f"Using {len(node_datas)} entites, {len(use_communities)} communities, {len(use_reasoning_path)} reasoning path items, {len(use_text_units)} text units"
-    )
-    entites_section_list = [["id", "entity", "type", "description", "rank"]]
-    for i, n in enumerate(node_datas):
-        entites_section_list.append(
-            [
-                i,
-                n["entity_name"],
-                n.get("entity_type", "UNKNOWN"),
-                n.get("description", "UNKNOWN"),
-                n["rank"],
-            ]
-        )
-    entities_context = list_of_list_to_csv(entites_section_list)
-    
-    reasoning_path_section_list = [
-        ["id", "source", "target", "description", "weight", "rank"]
-    ]
-    for i, e in enumerate(use_reasoning_path):
-        reasoning_path_section_list.append(
-            [
-                i,
-                e["src_tgt"][0],
-                e["src_tgt"][1],
-                e["description"],
-                e["weight"],
-                e["rank"],
-            ]
-        )
-    reasoning_path_context = list_of_list_to_csv(reasoning_path_section_list)
-    #reasoning_path_context = ''
-    # reasoning_path_context = list_of_list_to_csv([["id", "content"]] + [[i, p] for i, p in enumerate(reasoning_path)])
-    ################
-    if use_communities:
-        use_communities = await rerank_communities(query,use_communities, ce_weight=0.5)
-
-    # for c in use_communities:
-    #     logging.info(f"{c['title']} {c['final_score']}")
-    ################    
-    communities_section_list = [["id", "content"]]
-    for i, c in enumerate(use_communities):
-        communities_section_list.append([i, c["report_string"].replace("\n", " ")])
-    communities_context = list_of_list_to_csv(communities_section_list)
-
-    ################
-    if use_text_units:
-        use_text_units = await rerank_text_units(query, use_text_units, ce_weight=0.5)
-    # for tu in use_text_units:
-    #     logging.info(f"{tu['content'][:40]} -- {tu['final_score']:.4f}")
-    ################
-    text_units_section_list = [["id", "content"]]
-    for i, t in enumerate(use_text_units):
-        text_units_section_list.append([i, t["content"]])
-    text_units_context = list_of_list_to_csv(text_units_section_list)
-
-    # display reference info
-    entities = [n["entity_name"] for n in node_datas]
-    communities = [(c["level"], c["title"]) for c in use_communities]
-    chunks = [(t["full_doc_id"], t["chunk_order_index"]) for t in use_text_units]
-
-    references_context = (
-        f"Entities ({len(entities)}): {entities}\n\n"
-        f"Communities (level, cluster_id) ({len(communities)}): {communities}\n\n"
-        f"Chunks (doc_id, chunk_index) ({len(chunks)}): {chunks}\n"
-    )
-
-    #logging.info(f"====== References ======:\n{references_context}")
-    return f"""
------Backgrounds-----
-```csv
-{communities_context}
-```
------Reasoning Path-----
-```csv
-{reasoning_path_context}
-```
------Detail Entity Information-----
-```csv
-{entities_context}
-```
------Source Documents-----
-```csv
-{text_units_context}
-```
-"""
-
-
-

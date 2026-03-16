@@ -460,6 +460,228 @@ Text: {input_text}
 Output:
 """
 
+# baked in causal annotation
+PROMPTS["hi_relation_extraction_causal"] = """
+Given a text document that is potentially relevant to a list of entities, identify all relationships among the given identified entities.
+
+-Steps-
+1. From the entities given by user, identify all pairs of (source_entity, target_entity) that are *clearly related* to each other.
+For each pair of related entities, extract:
+
+Required (same as before):
+- source_entity
+- target_entity
+- relationship_description
+- relationship_strength (numeric)
+
+NEW (causal annotation inside the same tuple):
+- is_causal: true/false
+- direction: "src_to_tgt" | "tgt_to_src" | "unknown"
+- causal_strength: 0-1 (0 if non-causal)
+- causal_type: "direct" | "indirect" | "correlation" | "temporal" | "mechanism" | "unknown"
+- evidence: tight paraphrase from the TEXT (EMPTY if non-causal)
+- notes: very short justification (EMPTY if non-causal)
+
+Causality definition:
+Mark is_causal=true if the text indicates SRC causes/influences/enables/prevents/produces/leads to/results in/affects TGT (soft causality counts).
+If unsure, set is_causal=false.
+
+OUTPUT FORMAT (REQUIRED FOR REAL DATA):
+You MUST output the EXTENDED format with EXACTLY 11 fields in this exact order:
+
+("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_description>{tuple_delimiter}<is_causal>{tuple_delimiter}<direction>{tuple_delimiter}<causal_strength>{tuple_delimiter}<causal_type>{tuple_delimiter}<evidence>{tuple_delimiter}<notes>{tuple_delimiter}<relationship_strength>)
+
+Defaults when non-causal:
+If is_causal=false, you MUST use:
+direction=unknown, causal_strength=0.0, causal_type=unknown, evidence="", notes="".
+
+Delimiter safety (IMPORTANT):
+- NEVER include {tuple_delimiter} or {record_delimiter} or {completion_delimiter} inside ANY field.
+- If the text contains those characters/strings, PARAPHRASE instead of quoting.
+
+2. Return output in English as a single list of all the relationships identified. Use **{record_delimiter}** as the list delimiter.
+
+3. When finished, output {completion_delimiter}
+
+######################
+FORMAT DEMONSTRATION (extended format)
+######################
+("relationship"{tuple_delimiter}"A"{tuple_delimiter}"B"{tuple_delimiter}"A increases B by providing funding."{tuple_delimiter}true{tuple_delimiter}src_to_tgt{tuple_delimiter}0.7{tuple_delimiter}"direct"{tuple_delimiter}"Funding from A enables B to expand."{tuple_delimiter}"Explicit enablement language."{tuple_delimiter}8)
+
+######################
+-Examples-  (KEEP UNCHANGED)
+######################
+Example 1:
+
+Entities: ["Alex", "Taylor", "Jordan", "Cruz", "The Device"]
+Text:
+while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.
+
+Then Taylor did something unexpected. They paused beside Jordan and, for a moment, observed the device with something akin to reverence. “If this tech can be understood..." Taylor said, their voice quieter, "It could change the game for us. For all of us.”
+
+The underlying dismissal earlier seemed to falter, replaced by a glimpse of reluctant respect for the gravity of what lay in their hands. Jordan looked up, and for a fleeting heartbeat, their eyes locked with Taylor's, a wordless clash of wills softening into an uneasy truce.
+
+It was a small transformation, barely perceptible, but one that Alex noted with an inward nod. They had all been brought here by different paths
+################
+Output:
+("relationship"{tuple_delimiter}"Alex"{tuple_delimiter}"Taylor"{tuple_delimiter}"Alex is affected by Taylor's authoritarian certainty and observes changes in Taylor's attitude towards the device."{tuple_delimiter}7){record_delimiter}
+("relationship"{tuple_delimiter}"Alex"{tuple_delimiter}"Jordan"{tuple_delimiter}"Alex and Jordan share a commitment to discovery, which contrasts with Cruz's vision."{tuple_delimiter}6){record_delimiter}
+("relationship"{tuple_delimiter}"Taylor"{tuple_delimiter}"Jordan"{tuple_delimiter}"Taylor and Jordan interact directly regarding the device, leading to a moment of mutual respect and an uneasy truce."{tuple_delimiter}8){record_delimiter}
+("relationship"{tuple_delimiter}"Jordan"{tuple_delimiter}"Cruz"{tuple_delimiter}"Jordan's commitment to discovery is in rebellion against Cruz's vision of control and order."{tuple_delimiter}5){record_delimiter}
+("relationship"{tuple_delimiter}"Taylor"{tuple_delimiter}"The Device"{tuple_delimiter}"Taylor shows reverence towards the device, indicating its importance and potential impact."{tuple_delimiter}9){completion_delimiter}
+
+#############################
+(KEEP YOUR ORIGINAL EXAMPLES HERE UNCHANGED)
+#############################
+
+#############################
+-Real Data-
+######################
+Entities: {entities}
+Text: {input_text}
+######################
+Output:
+""".strip()
+
+# PROMPTS["hi_relation_extraction_causal"] = """
+# Given a text document that is potentially relevant to a list of entities, identify all relationships among the given identified entities.
+
+# -Steps-
+# 1. From the entities given by user, identify all pairs of (source_entity, target_entity) that are *clearly related* to each other.
+# For each pair of related entities, extract:
+
+# Required (same as before):
+# - source_entity
+# - target_entity
+# - relationship_description
+# - relationship_strength (numeric)
+
+# NEW (causal annotation inside the same tuple):
+# - is_causal: true/false
+# - direction: "src_to_tgt" | "tgt_to_src" | "unknown"
+# - causal_strength: 0-1 (0 if non-causal)
+# - causal_type: "direct" | "indirect" | "correlation" | "temporal" | "mechanism" | "unknown"
+# - evidence: short quote or tight paraphrase from the TEXT (empty if non-causal)
+# - notes: very short justification
+
+# Causality definition:
+# Mark is_causal=true if the text indicates SRC causes/influences/enables/prevents/produces/leads to/results in/affects TGT (soft causality counts).
+# If unsure, set is_causal=false.
+
+# Format each relationship as:
+# ("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_description>{tuple_delimiter}<is_causal>{tuple_delimiter}<direction>{tuple_delimiter}<causal_strength>{tuple_delimiter}<causal_type>{tuple_delimiter}<evidence>{tuple_delimiter}<notes>{tuple_delimiter}<relationship_strength>)
+
+# Backward compatibility:
+# - If you cannot confidently label causality, output is_causal=false and use defaults:
+#   direction=unknown, causal_strength=0.0, causal_type=unknown, evidence="", notes="".
+# - (The examples below show the older minimal format, but for Real Data you MUST output the extended format above.)
+
+# 2. Return output in English as a single list of all the entities and relationships identified. Use **{record_delimiter}** as the list delimiter.
+
+# 3. When finished, output {completion_delimiter}
+
+# ######################
+# -Examples-
+# ######################
+# Example 1:
+
+# Entities: ["Alex", "Taylor", "Jordan", "Cruz", "The Device"]
+# Text:
+# while Alex clenched his jaw, the buzz of frustration dull against the backdrop of Taylor's authoritarian certainty. It was this competitive undercurrent that kept him alert, the sense that his and Jordan's shared commitment to discovery was an unspoken rebellion against Cruz's narrowing vision of control and order.
+
+# Then Taylor did something unexpected. They paused beside Jordan and, for a moment, observed the device with something akin to reverence. “If this tech can be understood..." Taylor said, their voice quieter, "It could change the game for us. For all of us.”
+
+# The underlying dismissal earlier seemed to falter, replaced by a glimpse of reluctant respect for the gravity of what lay in their hands. Jordan looked up, and for a fleeting heartbeat, their eyes locked with Taylor's, a wordless clash of wills softening into an uneasy truce.
+
+# It was a small transformation, barely perceptible, but one that Alex noted with an inward nod. They had all been brought here by different paths
+# ################
+# Output:
+# ("relationship"{tuple_delimiter}"Alex"{tuple_delimiter}"Taylor"{tuple_delimiter}"Alex is affected by Taylor's authoritarian certainty and observes changes in Taylor's attitude towards the device."{tuple_delimiter}7){record_delimiter}
+# ("relationship"{tuple_delimiter}"Alex"{tuple_delimiter}"Jordan"{tuple_delimiter}"Alex and Jordan share a commitment to discovery, which contrasts with Cruz's vision."{tuple_delimiter}6){record_delimiter}
+# ("relationship"{tuple_delimiter}"Taylor"{tuple_delimiter}"Jordan"{tuple_delimiter}"Taylor and Jordan interact directly regarding the device, leading to a moment of mutual respect and an uneasy truce."{tuple_delimiter}8){record_delimiter}
+# ("relationship"{tuple_delimiter}"Jordan"{tuple_delimiter}"Cruz"{tuple_delimiter}"Jordan's commitment to discovery is in rebellion against Cruz's vision of control and order."{tuple_delimiter}5){record_delimiter}
+# ("relationship"{tuple_delimiter}"Taylor"{tuple_delimiter}"The Device"{tuple_delimiter}"Taylor shows reverence towards the device, indicating its importance and potential impact."{tuple_delimiter}9){completion_delimiter}
+# #############################
+# ######################
+# (KEEP YOUR ORIGINAL EXAMPLES HERE UNCHANGED)
+
+# #############################
+# -Real Data-
+# ######################
+# Entities: {entities}
+# Text: {input_text}
+# ######################
+# Output:
+# """.strip()
+
+
+# #added
+
+# PROMPTS["causal_edge_annotation"] = """
+# You are given ONE extracted relationship between two entities from text.
+
+# Task:
+# Decide whether the relationship expresses CAUSALITY (including soft causality like influence/affect/enable/prevent), or is NON-CAUSAL (association, mention, identity, membership, authorship, location, etc.).
+
+# Return exactly ONE JSON object ONLY (no markdown), with fields:
+# {{
+#   "is_causal": true/false,
+#   "direction": "src_to_tgt" | "tgt_to_src" | "unknown",
+#   "causal_strength": 0-1,
+#   "causal_type": "direct" | "indirect" | "correlation" | "temporal" | "mechanism" | "unknown",
+#   "evidence": "<short quote or tight paraphrase from TEXT_EVIDENCE, or empty string>",
+#   "notes": "<very short justification>"
+# }}
+
+# Causality definition (use this):
+# Label is_causal=true if the text indicates that one side CHANGES, PRODUCES, DETERMINES, ENABLES, PREVENTS, INCREASES/DECREASES, TRIGGERS, MAKES, FORCES, CAUSES, LEADS TO, RESULTS IN, or INFLUENCES/AFFECTS the other.
+# - “influences/affects” counts as causal (soft causality) if the text implies an effect, even if not quantified.
+
+# Non-causal (set is_causal=false) if it is any of:
+# - simple mention / co-occurrence / comparison / symbolism
+# - identity / definition / alias (“X is Y”)
+# - authorship / publication / credit (“X wrote/produced/published Y”)
+# - location / part-of / membership / contains
+# - temporal sequence WITHOUT implied effect (“after X, Y happened” but no “because/therefore/led to”)
+
+# How to decide (balanced):
+# - Prefer precision, BUT do not require scientific proof. If the wording implies an effect (“made them”, “caused”, “so that”, “because”, “led to”, “in order to”), mark causal.
+# - If unsure, still set is_causal=false.
+
+# Direction:
+# - "src_to_tgt" if SRC causes/influences TGT.
+# - "tgt_to_src" if TGT causes/influences SRC.
+# - "unknown" only if is_causal=true but direction cannot be determined.
+
+# Strength (use these bins):
+# - 0.9–1.0: explicit cause words (“causes”, “results in”, “leads to”, “because of”)
+# - 0.6–0.8: clear influence/enable/prevent language (“influences”, “makes”, “allows”, “prevents”)
+# - 0.3–0.5: weaker implied effect (“associated with causing…”, “seems to lead to…”) — only if still effect-implying
+# - 0.0: non-causal
+
+# Type:
+# - direct: explicit cause-effect
+# - indirect: chain implied
+# - temporal: timing + implied effect (not just sequence)
+# - correlation: “associated/linked” with a hinted effect
+# - mechanism: explains how/why
+# - unknown: can’t classify
+
+# Output requirements:
+# - Valid JSON only (double quotes for strings).
+# - If is_causal=false: set direction="unknown", causal_strength=0.0, causal_type="unknown", evidence="".
+# - If is_causal=true: evidence MUST be non-empty and come from TEXT_EVIDENCE.
+
+# Inputs:
+# SRC: {src}
+# TGT: {tgt}
+# RELATION_DESC: {rel_desc}
+
+# TEXT_EVIDENCE:
+# {evidence_text}
+# """
+
+
 
 PROMPTS[
     "summarize_entity_descriptions"
@@ -570,7 +792,66 @@ Do not include information where the supporting evidence for it is not provided.
 
 ---Goal---
 
+Generate a response of the target length and format that responds to the user's question, summarizing all information in the input data tables appropriate for the response length and format.
+
+If you don't know the answer, just say so. Do not make anything up.
+
+Do not include information where the supporting evidence for it is not provided.
+
+
+---Target response length and format---
+
+{response_type}
+
+Add sections and commentary to the response as appropriate for the length and format. Style the response in markdown.
+"""
+
+PROMPTS[
+    "local_rag_response_causal"
+] = """---Role---
+
+You are a helpful assistant responding to questions about data in the tables provided. You are especially attentive to causal relationships when they are available.
+
+
+---Goal---
+
 Generate a response of the target length and format that responds to the user's question, summarizing all information in the input data tables appropriate for the response length and format, and incorporating any relevant general knowledge.
+
+When reasoning over the "Reasoning Path" table:
+- Prioritize edges where is_causal = true.
+- Use causal_direction to respect cause → effect ordering.
+- Consider causal_strength when weighing relationships.
+- Explicitly describe cause-effect chains when relevant.
+- Distinguish clearly between correlation and causation.
+
+If you don't know the answer, just say so. Do not make anything up.
+Do not include information where the supporting evidence for it is not provided.
+
+
+---Target response length and format---
+
+{response_type}
+
+
+---Data tables---
+
+{context_data}
+
+
+---Goal---
+
+Generate a response of the target length and format that responds to the user's question, summarizing all information in the input data tables appropriate for the response length and format, and incorporating any relevant general knowledge.
+
+When causal metadata is available:
+- Prefer explanations grounded in explicit causal edges.
+- Use directional information to structure reasoning.
+- Highlight multi-step causal chains if present.
+- Avoid inferring causality where is_causal = false.
+
+When query relevance scores are provided:
+- Use higher‑scoring passages as the primary evidence for your answer.
+- Ignore or minimize information from low‑scoring passages to reduce noise.
+- If no relevance scores are available, rely only on the most clearly related context.
 
 If you don't know the answer, just say so. Do not make anything up.
 

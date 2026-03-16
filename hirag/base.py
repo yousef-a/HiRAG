@@ -6,12 +6,14 @@ import numpy as np
 
 @dataclass
 class QueryParam:
-    mode: Literal["hi_global", "hi_local", "hi_bridge", "hi_nobridge", "naive", "hi"] = "hi"
+    mode: Literal["hi_global", "hi_local", "hi_bridge", "hi_nobridge", "naive", "hi", "hi_rerank", "hi_causal"] = "hi"
     only_need_context: bool = False
     response_type: str = "Multiple Paragraphs"
+    #response_type: str = "Short Answers"
     level: int = 2
     top_k: int = 20         # retrieve top-k entities
     top_m: int = 10         # retrieve top-m entities in each retrieved community
+    community_threshold: float = 0
     # naive search
     naive_max_token_for_text_unit = 10000
     # hi search
