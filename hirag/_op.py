@@ -1,3 +1,4 @@
+import secrets
 import re
 import json
 import asyncio
@@ -30,9 +31,10 @@ from .base import (
     TextChunkSchema,
     QueryParam,
 )
+from ._query_ranker import rerank_pipeline_entities, rerank_pipeline_edges, rerank_text_units, rerank_communities
+# from ._community_report_reranker import 
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
 from ._cluster_utils import Hierarchical_Clustering
-
 
 @contextmanager
 def timer():
@@ -1145,7 +1147,7 @@ async def _find_most_related_edges_from_paths(
     #                     )
     all_reasoning_path = await knowledge_graph_inst.subgraph_edges(path)
     all_edges = set()
-    print(all_reasoning_path)
+    #print(all_reasoning_path)
     all_edges.update([tuple(sorted(e[:2])) for e in all_reasoning_path])
     all_edges = list(all_edges)
     all_edges_pack = await asyncio.gather(
@@ -1464,7 +1466,7 @@ async def _build_hierarchical_query_context(
         f"Chunks (doc_id, chunk_index) ({len(chunks)}): {chunks}\n"
     )
 
-    logging.info(f"====== References ======:\n{references_context}")
+    #logging.info(f"====== References ======:\n{references_context}")
     return f"""
 -----Backgrounds-----
 ```csv
@@ -1824,6 +1826,7 @@ async def hierarchical_query(
             text_chunks_db,
             query_param,
         )
+    logging.info(f"Length of context: {len(context)}")
     if query_param.only_need_context:
         return context
     if context is None:
@@ -1838,6 +1841,40 @@ async def hierarchical_query(
     )
     return response
 
+async def hierarchical_query_reranked(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    community_reports: BaseKVStorage[CommunitySchema],
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+    global_config: dict,
+) -> str:
+    use_model_func = global_config["best_model_func"]
+    with timer():
+        context = await _build_hierarchical_query_reranked_context(
+            query,
+            knowledge_graph_inst,
+            entities_vdb,
+            community_reports,
+            text_chunks_db,
+            query_param,
+        )
+    logging.info(f"Length of context: {len(context)}")        
+    if query_param.only_need_context:
+        return context
+    if context is None:
+        return PROMPTS["fail_response"]
+    sys_prompt_temp = PROMPTS["local_rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        context_data=context, response_type=query_param.response_type
+    )
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+    )
+    return response
+    
 async def hierarchical_bridge_query(
     query,
     knowledge_graph_inst: BaseGraphStorage,
@@ -2006,3 +2043,237 @@ async def naive_query(
         system_prompt=sys_prompt,
     )
     return response
+
+async def _build_hierarchical_query_reranked_context(
+    query,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    community_reports: BaseKVStorage[CommunitySchema],
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+):
+    results = await entities_vdb.query(query, top_k=query_param.top_k * 10)          # find the top-k(20) related entities
+
+    if not len(results):    # results just with entity name
+        return None
+    node_datas = await asyncio.gather(      # get full information of retrieved entities
+        *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
+    )
+    if not all([n is not None for n in node_datas]):    # for robustness
+        logger.warning("Some nodes are missing, maybe the storage is damaged")
+    node_degrees = await asyncio.gather(
+        *[knowledge_graph_inst.node_degree(r["entity_name"]) for r in results]
+    )
+    node_datas = [                          # add rank, which is the degree
+        {**n, "entity_name": k["entity_name"], "rank": d}
+        for k, n, d in zip(results, node_datas, node_degrees)
+        if n is not None
+    ]
+    overall_node_datas = node_datas
+    node_datas = node_datas[:query_param.top_k]
+
+    use_communities = await _find_most_related_community_from_entities(     # related communities
+        node_datas, query_param, community_reports
+    )
+    use_text_units = await _find_most_related_text_unit_from_entities(
+        node_datas, query_param, text_chunks_db, knowledge_graph_inst
+    )
+    # use_relations = await _find_most_related_edges_from_entities(
+    #     node_datas, query_param, knowledge_graph_inst
+    # )
+
+    async def find_path_with_required_nodes(knowledge_graph_inst, source, target, required_nodes):
+        # inital final path
+        final_path = []
+        # start node
+        current_node = source
+
+        # all gdb cls
+        from ._storage.gdb_neo4j import Neo4jStorage
+        from ._storage.gdb_networkx import NetworkXStorage
+        
+        # traverse the required nodes
+        for next_node in required_nodes:
+            # 找到从当前节点到下一个必经节点的最短路径
+            try:
+                if isinstance(knowledge_graph_inst, Neo4jStorage):
+                    # use Neo4j's shortest_path method
+                    sub_path = await knowledge_graph_inst.shortest_path(current_node, next_node)
+                elif isinstance(knowledge_graph_inst, NetworkXStorage):
+                    # use NetworkX's shortest_path method
+                    sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=next_node)
+                else:
+                    # use NetworkX by default
+                    sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=next_node)
+            except nx.NetworkXNoPath:
+                # raise ValueError(f"No path between {current_node} and {next_node}.")
+                final_path.extend([next_node])
+                current_node = next_node
+                continue
+            
+            # merge paths (avoid adding the current node again)
+            if final_path:
+                final_path.extend(sub_path[1:])  # add from the second node, avoid adding the current node again
+            else:
+                final_path.extend(sub_path)
+            
+            # update the current node to the next required node
+            current_node = next_node
+
+        # finally, the path from the last required node to the target node
+        try:
+            if isinstance(knowledge_graph_inst, Neo4jStorage):
+                # use Neo4j's shortest_path method
+                sub_path = await knowledge_graph_inst.shortest_path(current_node, target)
+            elif isinstance(knowledge_graph_inst, NetworkXStorage):
+                # use NetworkX's shortest_path method
+                sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=target)
+            else:
+                # use NetworkX by default
+                sub_path = nx.shortest_path(knowledge_graph_inst._graph, source=current_node, target=target)
+            final_path.extend(sub_path[1:])  # add from the second node, avoid adding the current node again
+        except nx.NetworkXNoPath:
+            # raise ValueError(f"No path between {current_node} and {target}.")
+            final_path.extend([target])
+
+        return final_path
+
+    # find some top-k entities in each communities in use_communities
+    key_entities = []
+    max_entity_num = query_param.top_m
+    if use_communities:
+        for c in use_communities:
+            cur_community_key_entities = []
+            community_entities = c['nodes']
+            # find the top-k entities in this community
+            cur_community_key_entities.extend(
+                [e for e in overall_node_datas if e['entity_name'] in community_entities][:max_entity_num]
+            )
+            key_entities.append(cur_community_key_entities)
+    else:
+        key_entities = [overall_node_datas[:max_entity_num]]
+    # unique key entities
+    key_entities = [[e['entity_name'] for e in k] for k in key_entities]
+    key_entities = list(set([k for kk in key_entities for k in kk]))
+    # find the shortest path between the key entities
+    try:
+        path = await find_path_with_required_nodes(knowledge_graph_inst, key_entities[0], key_entities[-1], key_entities[1:-1])
+        # path = list(set(path))
+        path_datas = await asyncio.gather(      # get full information of retrieved entities
+            *[knowledge_graph_inst.get_node(r) for r in path]
+        )
+        path_degrees = await asyncio.gather(
+            *[knowledge_graph_inst.node_degree(r) for r in path]
+        )
+        path_datas = [                          # add rank, which is the degree
+            {**n, "entity_name": k, "rank": d}
+            for k, n, d in zip(path, path_datas, path_degrees)
+            if n is not None
+        ]
+        # use_reasoning_path = await _find_most_related_edges_from_entities(
+        #                     path_datas, query_param, knowledge_graph_inst
+        #                 )
+        use_reasoning_path = await _find_most_related_edges_from_paths(
+                                path_datas, path, query_param, knowledge_graph_inst
+                            )
+    except ValueError as e:
+        print(e)
+    
+    # # fetch the relations of the reasoning paths
+    # reasoning_path = []
+    # for i in range(len(path) - 1):
+    #     src = path[i]
+    #     tgt = path[i + 1]
+    #     cur_relation = (await knowledge_graph_inst.get_edge(src, tgt))['description']
+    #     reasoning_path.append(cur_relation)
+    # reasoning_path = list(set(reasoning_path))
+
+    logger.info(
+        f"Using {len(node_datas)} entites, {len(use_communities)} communities, {len(use_reasoning_path)} reasoning path items, {len(use_text_units)} text units"
+    )
+    entites_section_list = [["id", "entity", "type", "description", "rank"]]
+    for i, n in enumerate(node_datas):
+        entites_section_list.append(
+            [
+                i,
+                n["entity_name"],
+                n.get("entity_type", "UNKNOWN"),
+                n.get("description", "UNKNOWN"),
+                n["rank"],
+            ]
+        )
+    entities_context = list_of_list_to_csv(entites_section_list)
+    
+    reasoning_path_section_list = [
+        ["id", "source", "target", "description", "weight", "rank"]
+    ]
+    for i, e in enumerate(use_reasoning_path):
+        reasoning_path_section_list.append(
+            [
+                i,
+                e["src_tgt"][0],
+                e["src_tgt"][1],
+                e["description"],
+                e["weight"],
+                e["rank"],
+            ]
+        )
+    reasoning_path_context = list_of_list_to_csv(reasoning_path_section_list)
+    #reasoning_path_context = ''
+    # reasoning_path_context = list_of_list_to_csv([["id", "content"]] + [[i, p] for i, p in enumerate(reasoning_path)])
+    ################
+    if use_communities:
+        use_communities = await rerank_communities(query,use_communities, ce_weight=0.5)
+
+    # for c in use_communities:
+    #     logging.info(f"{c['title']} {c['final_score']}")
+    ################    
+    communities_section_list = [["id", "content"]]
+    for i, c in enumerate(use_communities):
+        communities_section_list.append([i, c["report_string"].replace("\n", " ")])
+    communities_context = list_of_list_to_csv(communities_section_list)
+
+    ################
+    if use_text_units:
+        use_text_units = await rerank_text_units(query, use_text_units, ce_weight=0.5)
+    # for tu in use_text_units:
+    #     logging.info(f"{tu['content'][:40]} -- {tu['final_score']:.4f}")
+    ################
+    text_units_section_list = [["id", "content"]]
+    for i, t in enumerate(use_text_units):
+        text_units_section_list.append([i, t["content"]])
+    text_units_context = list_of_list_to_csv(text_units_section_list)
+
+    # display reference info
+    entities = [n["entity_name"] for n in node_datas]
+    communities = [(c["level"], c["title"]) for c in use_communities]
+    chunks = [(t["full_doc_id"], t["chunk_order_index"]) for t in use_text_units]
+
+    references_context = (
+        f"Entities ({len(entities)}): {entities}\n\n"
+        f"Communities (level, cluster_id) ({len(communities)}): {communities}\n\n"
+        f"Chunks (doc_id, chunk_index) ({len(chunks)}): {chunks}\n"
+    )
+
+    #logging.info(f"====== References ======:\n{references_context}")
+    return f"""
+-----Backgrounds-----
+```csv
+{communities_context}
+```
+-----Reasoning Path-----
+```csv
+{reasoning_path_context}
+```
+-----Detail Entity Information-----
+```csv
+{entities_context}
+```
+-----Source Documents-----
+```csv
+{text_units_context}
+```
+"""
+
+
+

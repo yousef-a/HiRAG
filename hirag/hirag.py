@@ -29,6 +29,7 @@ from ._op import (
     hierarchical_global_query,
     hierarchical_nobridge_query,
     naive_query,
+    hierarchical_query_reranked,
 )
 from ._storage import (
     JsonKVStorage,
@@ -232,6 +233,8 @@ class HiRAG:
             raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_local mode")
         if param.mode == "hi_global" and not self.enable_hierachical_mode:
             raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_global mode")
+        if param.mode == "hi_rerank" and not self.enable_hierachical_mode:
+            raise ValueError("enable_hierachical_mode is False, cannot query in hierarchical_rerank mode")
 
         if param.mode == "hi":                        # retrieve with hierarchical knowledge
             response = await hierarchical_query(
@@ -253,6 +256,16 @@ class HiRAG:
                 param,
                 asdict(self),
             )
+        elif param.mode == "hi_rerank":                        # retrieve with hierarchical knowledge with reranker
+            response = await hierarchical_query_reranked(
+                query,
+                self.chunk_entity_relation_graph,
+                self.entities_vdb,
+                self.community_reports,
+                self.text_chunks,
+                param,
+                asdict(self),
+            )          
         elif param.mode == "hi_local":                  # retrieve with only local knowledge
             response = await hierarchical_local_query(
                 query,
