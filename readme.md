@@ -1,5 +1,14 @@
 <div align="center">
 
+# HiRAG: Causal Relationships and Query-Aware Re-ranking Mechanism
+
+## An Enhancement on the original HiRAG work done by here: https://github.com/hhy-huang/HiRAG
+
+## Main contributer to this Enhancement work: Devendra Kumar Rajasekaran & Yousif Al Ali 
+
+
+<div align="center">
+
 # 🤗 HiRAG: Retrieval-Augmented Generation with Hierarchical Knowledge
 
 <p align="center">
