@@ -37,8 +37,6 @@ OPENAI_MODEL = config['openai']['model_eval']
 OPENAI_API_KEY = config['openai']['api_key']
 OPENAI_URL = config['openai']['base_url']
 
-
-
 def eval_oq_openai_batch(query_file, result1_file, result2_file, output_file_path):  # with original query
     client = OpenAI(base_url=OPENAI_URL, api_key=OPENAI_API_KEY)
     print (f"Model used {OPENAI_MODEL}")
